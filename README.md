@@ -19,4 +19,4 @@ Here is my automatic and "smart" catfeeder
 
   3D printed files (and description) on Printables : https://www.printables.com/model/1218706-jp-ecatfeeder
 
-  
+  PCB available at PCBWay shared project : https://www.pcbway.com/project/shareproject/JP_eCatFeeder_35b160a9.html
