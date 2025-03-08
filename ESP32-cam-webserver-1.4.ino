@@ -224,7 +224,7 @@ void print_wakeup_reason() {
       TouchWake = true;
       break;
     case ESP_SLEEP_WAKEUP_ULP: Serial.println("Wakeup caused by ULP program"); break;
-    default: Serial.printf("Wakeup was not caused by deep sleep: %d\n", wakeup_reason); break;
+    default: Serial.printf("Wakeup was not caused by deep sleep: %d\n", wakeup_reason); doGCM = 1; break;
   }
 }
 
