@@ -18,8 +18,9 @@
 bool shouldSaveConfig = false;
 
 int threshold = 40;           //Threshold value for touchpads pins
-bool touch6detected = false;  //touch6 used to launch WifiManager (hold it while reseting)
+bool touch6detected = false;  //touch6 used to launch WifiManager (hold it while reseting) and to calibrate tare and 50g (touch and long touch when running)
 long lastTouch;
+long lastDebug;
 
 //callback notifying us of the need to save config
 void saveConfigCallback() {
@@ -44,8 +45,8 @@ String theMAC = "";  // to store MAC address
 #define TIMER_WIDTH 11
 #define PIN_CLOCK 12  //output to generate clock on Hx711
 #define PIN_DOUT 13   //input Dout from Hx711
-#define PIN_CAL50 T6
-#define PIN_TARE T0
+#define PIN_CAL50 14
+#define PIN_TARE 4
 
 
 /* This sketch is a extension/expansion/reork of the 'official' ESP32 Camera example
@@ -145,8 +146,8 @@ unsigned long Timeout = 0;
 //WhatsApp callmebot : https://www.callmebot.com/blog/free-api-whatsapp-messages/
 // +international_country_code + phone number
 // France +33, example: +36010100101
-String phoneNumber = "+your_phone_number";
-String apiKey = "your_API_key";
+String phoneNumber = "+your_phone";
+String apiKey = "your_APIkey";
 
 //touchpad
 
@@ -179,10 +180,12 @@ String password = "";
 boolean hasWifiCredentials = false;
 
 //scale
-unsigned long CalibZero = 0;
+long CalibZero = 0;
 long Calib = 1;
 float AverageWeight = 0;
 float RealTimeWeight = 0;
+#define FILTER_SAMPLES 200          // 1 = no filtering (faster single acquisition but noise on the hall sensor),
+
 
 boolean SendAlarm = false;
 boolean SendEating = true;
@@ -199,9 +202,8 @@ WiFiUDP Udp;
 /* ===CODE_STARTS_HERE========================================== */
 
 #define xDEBUG_OUT
-//#define W_DEBUG     //debug Wifi and firebase
-#define G_DEBUG  //debug GCM serveur
-#define DEBUG_OUT
+//#define W_DEBUG     //debug Wifi
+#define DEBUG_WEIGHT
 #define DEBUG
 //#define xxDEBUG
 //#define TEST
@@ -248,12 +250,17 @@ void setup() {
   ssid = preferences.getString("ssid", "mySSID");  // Get the ssid  value, if the key does not exist, return a default value of ""
   password = preferences.getString("password", "myPassword");
   Calib = preferences.getLong("Calib", 0);
+  CalibZero = preferences.getLong("CalibZero", 0);
   LastFeedHour = preferences.getInt("LastFeedHour", 0);
   LastFeedDay = preferences.getInt("LastFeedDay", 0);
   FeedHour1 = preferences.getInt("FeedHour1", 7);
   FeedHour2 = preferences.getInt("FeedHour2", 20);
 
   //preferences.end();  // Close the Preferences
+  Serial.print("calibZero : ");
+  Serial.println(CalibZero);
+  Serial.print("calib50 : ");
+  Serial.println(Calib);
 
   //servo
   ledcSetup(5, 50, TIMER_WIDTH);  // channel 5, 50 Hz, 11-bit width, generates the PPM signal
@@ -500,14 +507,15 @@ void setup() {
 #endif
   }
 
-  doGCM = 1;  //force feeeding (Get Cat Message)
+  //  doGCM = 1;  //force feeeding
 
   AverageWeight = GetRawWeight();
   AverageWeight = CalibZero - AverageWeight;
   AverageWeight = AverageWeight * 50.0 / Calib;
   RealTimeWeight = AverageWeight;
 
-  Timeout = millis();  //arm software watchdog
+  Timeout = millis();      //arm software watchdog
+  touch6detected = false;  // reset touch6
 }
 
 void printLocalTime() {
@@ -536,7 +544,7 @@ void SetIF(void) {
   //Start UDP
   Udp.begin(localPort);  // UDP messages are activated and could ba used to send various messagesto the cat feeder (see below into the code)
 }
-
+//**********************************************************************************************
 
 void loop() {
   // Just loop forever.
@@ -547,6 +555,14 @@ void loop() {
   AverageWeight = GetRawWeight();
   AverageWeight = CalibZero - AverageWeight;
   AverageWeight = AverageWeight * 50.0 / Calib;
+#if defined DEBUG_WEIGHT
+  if ((millis() - lastDebug) > 2000) {
+    lastDebug = millis();
+    Serial.print("weight : ");
+    Serial.println(AverageWeight);
+    Serial.println("");
+  }
+#endif
 
   if ((abs(AverageWeight - RealTimeWeight) > 10.0) && (SendEating == true))  // if weight has changed more than 10g then cat is eating
   {
@@ -560,6 +576,7 @@ void loop() {
 
   if ((AverageWeight >= Plate) && (FeedNow > 0))  //stop feeding when daily ration is reached
   {
+    Serial.println("stop feeding when daily ration is reached");
     FeedNow = 0;
     ServoTicker.detach();
     ledcWrite(5, 0);
@@ -579,11 +596,7 @@ void loop() {
     sendWhatsAppMessage(Mess);
   }
 
-#if defined xxDEBUG
-  Serial.println("");
-  Serial.print("calibrated weight : ");
-  Serial.println(AverageWeight);
-#endif
+
 
 
   // UDP process : if there's data available, read a packet
@@ -625,7 +638,7 @@ void loop() {
     else if (test.startsWith("CalibZero"))  // calibration Zero of scale
     {
       CalibZero = GetRawWeight();
-      preferences.putULong("CalibZero", CalibZero);
+      preferences.putLong("CalibZero", CalibZero);
       SendAlarm = true;
       Mess = "Calib zero";
       SendEating = false;
@@ -658,26 +671,28 @@ void loop() {
   } else delay(100);
 
   //manage touch pads
-  if ((millis() - lastTouch) > 1000) {
-
-    if (ftouchRead(PIN_CAL50) < threshold)  //calibration plate weight
+  if ((millis() - lastTouch) > 3000) {
+    lastTouch = millis();
+    if (ftouchRead(PIN_CAL50) < threshold)  //simple touch on VAL50 T6 pin (3s touch)
     {
-      lastTouch = millis();
-      Calib = (-GetRawWeight() + CalibZero);
-      preferences.putLong("Calib", Calib);
-      Serial.print("Calib50 = ");
-      Serial.println(Calib);
-
-    } else if (ftouchRead(PIN_TARE) < threshold)  //ON & MINUS = decrease highPressure
-    {
-      lastTouch = millis();
-      CalibZero = GetRawWeight();
-      preferences.putULong("CalibZero", CalibZero);
-      SendAlarm = true;
-      Mess = "Calib zero";
-      SendEating = false;
-      Serial.print("calibZero ");
-      Serial.println(CalibZero);
+      if ((ftouchRead(PIN_CAL50) < threshold) && touch6detected)  //long press (6s touch)
+      {
+        Calib = (-GetRawWeight() + CalibZero);
+        preferences.putLong("Calib", Calib);
+        SendAlarm = true;
+        Mess = "Calib 50";
+        Serial.print("Calib50 = ");
+        Serial.println(Calib);
+      } else {  //simple press
+        touch6detected = true;
+        CalibZero = GetRawWeight();
+        preferences.putLong("CalibZero", CalibZero);
+        SendAlarm = true;
+        Mess = "Calib zero";
+        SendEating = false;
+        Serial.print("calibZero ");
+        Serial.println(CalibZero);
+      }
     }
   }
 
@@ -689,10 +704,10 @@ void loop() {
     doStop = 1;  //force stop
   }
   if ((doStop == 1) && (digitalRead(PIR_PIN) == LOW)) {
-#if defined DEBUG_OUT
+
     Serial.println("Going to sleep now");
     delay(200);
-#endif
+
     esp_deep_sleep_start();  //enter deeep sleep mode if PIR sensor is off and time out
   }
 }
@@ -766,15 +781,20 @@ void flip() {
 
 float GetRawWeight(void) {
   float AverageWeight;
-  unsigned long RawWeight;
+  unsigned long RawWeight, prevRawWeight;
+  // wait for the chip to become ready
   // wait for the chip to become ready
   long startTime = millis();
-  while ((digitalRead(PIN_DOUT) == HIGH) && ((millis() - startTime) < 80))
+  while ((digitalRead(PIN_DOUT) == HIGH) && ((millis() - startTime) < 1000))
     ;
-
+  if ((millis() - startTime) > 1000) {
+    Serial.println("weight error");
+  }
   AverageWeight = 0;
-  for (int j = 0; j < 200; j++) {
+  for (int j = 0; j < FILTER_SAMPLES; j++) {
     RawWeight = 0;
+    ;  //wait for data conversion ready
+
     // pulse the clock pin 24 times to read the data
     for (char i = 0; i < 24; i++) {
       digitalWrite(PIN_CLOCK, HIGH);
@@ -785,20 +805,25 @@ float GetRawWeight(void) {
     }
     // set the channel and the gain factor (A 128) for the next reading using the clock pin (one pulse)
     digitalWrite(PIN_CLOCK, HIGH);
+    delayMicroseconds(2);
     RawWeight = RawWeight ^ 0x800000;
     digitalWrite(PIN_CLOCK, LOW);
+    //smoothArray[j] = RawWeight;
+    if (j > 0) {
+      if (abs(RawWeight - prevRawWeight) > 10)  // filters abnormal weights variations
+      {
+        RawWeight = prevRawWeight;
+      }
+    } else prevRawWeight = RawWeight;
     AverageWeight += RawWeight;
+    prevRawWeight = RawWeight;
     delayMicroseconds(60);
   }
-  AverageWeight = AverageWeight / 200;
-#if defined xDEBUG
-  Serial.print("Raw weight : ");
-  Serial.println(AverageWeight);
-  Serial.println("");
-#endif
-
+  AverageWeight = AverageWeight / FILTER_SAMPLES;
   return AverageWeight;
 }
+
+
 
 
 
@@ -810,6 +835,12 @@ int ftouchRead(int gpio)  // this will filter false readings of touchRead() func
     readVal = touchRead(gpio);
     val = max(val, readVal);
   }
+#ifdef DEBUG
+  Serial.print("touch read : ");
+  Serial.print(gpio);
+  Serial.print(" value ");
+  Serial.println(val);
+#endif
   return val;
 }
 
