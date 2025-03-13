@@ -21,6 +21,7 @@ int threshold = 40;           //Threshold value for touchpads pins
 bool touch6detected = false;  //touch6 used to launch WifiManager (hold it while reseting) and to calibrate tare and 50g (touch and long touch when running)
 long lastTouch;
 long lastDebug;
+bool PIRreset = false;  // true if reset done by PIR interrupt
 
 //callback notifying us of the need to save config
 void saveConfigCallback() {
@@ -123,10 +124,19 @@ int positionServo = -RANGE;
 Ticker ServoTicker;
 
 //TIME
-boolean noTime = false;
+boolean hasNtpTime = true;
 int TimeZone = 1;
 int dst = 0;
-
+//these variable remain in RTC memory even in deep sleep or after software reset (https://github.com/espressif/esp-idf/issues/7718)(https://www.esp32.com/viewtopic.php?t=4931)
+RTC_NOINIT_ATTR boolean hasRtcTime = false;  //UTC time not acquired from smartphone
+//RTC_DATA_ATTR boolean hasRtcTime = false;   //will only survice to deepsleep reset... not software reset
+RTC_NOINIT_ATTR int hours;
+RTC_NOINIT_ATTR int seconds;
+RTC_NOINIT_ATTR int tvsec;
+RTC_NOINIT_ATTR int minutes;
+RTC_NOINIT_ATTR int days;
+RTC_NOINIT_ATTR int months;
+RTC_NOINIT_ATTR int years;
 //feed hours
 int LastFeedHour = 0;
 int LastFeedDay = 0;
@@ -182,9 +192,12 @@ boolean hasWifiCredentials = false;
 //scale
 long CalibZero = 0;
 long Calib = 1;
-float AverageWeight = 0;
-float RealTimeWeight = 0;
+long AverageWeight = 0;
+long RealTimeWeight = 0;
 #define FILTER_SAMPLES 200          // 1 = no filtering (faster single acquisition but noise on the hall sensor),
+#define REJECT_RATIO 40             //points to reject % left and right before averaging (if filter sample >1)
+long smoothArray[FILTER_SAMPLES];  // array for holding raw sensor values for current sensor
+
 
 
 boolean SendAlarm = false;
@@ -215,7 +228,10 @@ void print_wakeup_reason() {
   wakeup_reason = esp_sleep_get_wakeup_cause();
 
   switch (wakeup_reason) {
-    case ESP_SLEEP_WAKEUP_EXT0: Serial.println("Wakeup caused by external signal using RTC_IO"); break;
+    case ESP_SLEEP_WAKEUP_EXT0: Serial.println("Wakeup caused by external signal using RTC_IO");
+	Serial.println("Wakeup caused by external signal using RTC_IO");
+      PIRreset = true;
+	break;
     case ESP_SLEEP_WAKEUP_EXT1: Serial.println("Wakeup caused by external signal using RTC_CNTL"); break;
     case ESP_SLEEP_WAKEUP_TIMER: Serial.println("Wakeup caused by timer"); break;
     case ESP_SLEEP_WAKEUP_TOUCHPAD:
@@ -224,7 +240,10 @@ void print_wakeup_reason() {
       TouchWake = true;
       break;
     case ESP_SLEEP_WAKEUP_ULP: Serial.println("Wakeup caused by ULP program"); break;
-    default: Serial.printf("Wakeup was not caused by deep sleep: %d\n", wakeup_reason); doGCM = 1; break;
+    default: 
+	  Serial.printf("Wakeup was not caused by deep sleep: %d\n", wakeup_reason);
+      doGCM = 1;
+	  break;
   }
 }
 
@@ -256,12 +275,16 @@ void setup() {
   FeedHour1 = preferences.getInt("FeedHour1", 7);
   FeedHour2 = preferences.getInt("FeedHour2", 20);
 
-  //preferences.end();  // Close the Preferences
+  //preferences.end();  // Close the Preferences Serial.println("**************************");
   Serial.print("calibZero : ");
   Serial.println(CalibZero);
   Serial.print("calib50 : ");
   Serial.println(Calib);
-
+ Serial.print("last Feed Day : ");
+  Serial.println(LastFeedDay);
+   Serial.print("last Feed Hour : ");
+  Serial.println(LastFeedHour);
+  Serial.println("**************************");
   //servo
   ledcSetup(5, 50, TIMER_WIDTH);  // channel 5, 50 Hz, 11-bit width, generates the PPM signal
   ledcAttachPin(SERVO_PIN, 5);    // GPIO 22 assigned to channel 1
@@ -461,40 +484,47 @@ void setup() {
   delay(2000);
   configTime(TimeZone * 3600, dst * 0, "pool.ntp.org");
   printLocalTime();
+  if (hasNtpTime) {
+    time_t now;
+    struct tm* timeinfo;
+    time(&now);
+    timeinfo = localtime(&now);
 
-  time_t now;
-  struct tm* timeinfo;
-  time(&now);
-  timeinfo = localtime(&now);
+    hours = timeinfo->tm_hour;
+    seconds = timeinfo->tm_sec;
+    minutes = timeinfo->tm_min;
 
-  //    hours = timeinfo->tm_hour;
-  //    seconds = timeinfo->tm_sec;
-  //    minutes = timeinfo->tm_min;
-  //
-  //    days = timeinfo->tm_mday;
-  //    months = timeinfo->tm_mon + 1;
-  //    years = timeinfo->tm_year + 1900;
-  //
-  //
-  //
-  //    if (noTime)
-  //    {
-  //      hours = hour();
-  //      seconds = second();
-  //      minutes = minute();
-  //    }
+    days = timeinfo->tm_mday;
+    months = timeinfo->tm_mon + 1;
+    years = timeinfo->tm_year + 1900;
 
-  if (timeinfo->tm_mday != LastFeedDay)  // we not on the same day as last time
+    //set ESP32 time manually (hr, min, sec, day, mo, yr)
+    setTime(hours, minutes, seconds, days, months, years);
+    Serial.print("time after ntp: ");
+    struct timeval current_time;  //get ESP32 RTC time and save it
+    gettimeofday(&current_time, NULL);
+    tvsec = current_time.tv_sec;  //seconds since reboot
+
+  } else {
+    hours = hour();
+    seconds = second();
+    minutes = minute();
+    Serial.print("time from ESP32 RTC: ");
+  }
+  display_time();
+
+  if (days != LastFeedDay)  // we not on the same day as last time
   {
-    LastFeedDay = timeinfo->tm_mday;
+    LastFeedDay = days;
     LastFeedHour = 0;
     preferences.putInt("LastFeedHour", LastFeedHour);
     preferences.putInt("LastFeedDay", LastFeedDay);
   }
-  if ((timeinfo->tm_hour >= FeedHour2) && (LastFeedHour < FeedHour2)) {
+
+  if ((hours >= FeedHour2) && (LastFeedHour < FeedHour2)) {
     doGCM = 1;
   }
-  if ((timeinfo->tm_hour >= FeedHour1) && (LastFeedHour < FeedHour1)) {
+  if ((hours >= FeedHour1) && (LastFeedHour < FeedHour1)) {
     doGCM = 1;
   }
 #if defined TEST
@@ -522,10 +552,23 @@ void printLocalTime() {
   struct tm timeinfo;
   if (!getLocalTime(&timeinfo)) {
     Serial.println("Failed to obtain time");
-    noTime = true;
+    hasNtpTime = true;
     return;
   }
   Serial.println(&timeinfo, "%A, %B %d %Y %H:%M:%S");
+}
+void display_time(void) {
+  Serial.print(year());
+  Serial.print("-");
+  Serial.print(month());
+  Serial.print("-");
+  Serial.print(day());
+  Serial.print(" at ");
+  Serial.print(hour());
+  Serial.print(":");
+  Serial.print(minute());
+  Serial.print(":");
+  Serial.println(second());
 }
 
 // Notification LED
@@ -704,7 +747,23 @@ void loop() {
     doStop = 1;  //force stop
   }
   if ((doStop == 1) && (digitalRead(PIR_PIN) == LOW)) {
+    float hourDec = hour() + float(minute()) / 60. + float(second()) / 3600.;
+    float timeToSleepDec;
 
+
+
+    if (hourDec > FeedHour2) timeToSleepDec = 24 + FeedHour1 - hourDec;
+    else if (hourDec < FeedHour1) timeToSleepDec = FeedHour1 - hourDec;
+    else timeToSleepDec = FeedHour2 - hourDec;
+
+
+    Serial.print("will sleep (hour) : ");
+    Serial.println(timeToSleepDec);
+    timeToSleep = 3600 * timeToSleepDec;
+    Serial.print("will sleep (seconds) : ");
+    Serial.println(timeToSleep);
+    esp_sleep_enable_timer_wakeup(timeToSleep * uS_TO_S_FACTOR);  //allow timer deepsleep
+  
     Serial.println("Going to sleep now");
     delay(200);
 
@@ -781,7 +840,7 @@ void flip() {
 
 float GetRawWeight(void) {
   float AverageWeight;
-  unsigned long RawWeight, prevRawWeight;
+  long RawWeight, prevRawWeight;
   // wait for the chip to become ready
   // wait for the chip to become ready
   long startTime = millis();
